@@ -1,0 +1,880 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{balance}
+\usepackage{wasysym}
+
+\lstset{
+  basicstyle=\footnotesize\ttfamily,
+  breaklines=true,
+  frame=single,
+  xleftmargin=2em,
+  xrightmargin=1em,
+  columns=flexible,
+  keywordstyle=\color{blue!70!black},
+  commentstyle=\color{green!50!black},
+  stringstyle=\color{red!60!black},
+}
+
+\begin{document}
+
+\title{A Multi-Dimensional Priority Model for Heterogeneous DAG Workloads in Distributed Computing Continuums}
+
+\author{
+\IEEEauthorblockN{Authors}
+\IEEEauthorblockA{Affiliation}
+}
+
+\maketitle
+
+\begin{abstract}
+Distributed meta-orchestration platforms coordinate computational workloads across heterogeneous infrastructure spanning cloud, edge, and HPC systems. These platforms must schedule diverse workloads---from real-time safety-critical mine seismology to best-effort research analytics---on shared executor pools. Existing schedulers rely on a single integer priority, which conflates urgency, importance, fairness, and domain-specific value into one dimension, leading to priority inversions and starvation.
+
+We analyze eight realistic workload types---including a real-time IoT edge scenario requiring preemption of lower-priority work---identify common priority dimensions, and evaluate five scheduling approaches: weighted sum models, rule-based systems, lexicographic ordering, constraint-based optimization, and machine learning methods. Based on this analysis, we propose a hybrid priority model combining lexicographic urgency classes with weighted multi-dimensional scoring within each class. The model supports static, dynamic, and DAG-dependent priority dimensions while maintaining structural guarantees for safety-critical workloads and multi-tenant fairness. We describe the model formally, show how it instantiates for each workload type, and discuss its properties with respect to preemption, starvation freedom, interpretability, and cross-environment scheduling.
+\end{abstract}
+
+\begin{IEEEkeywords}
+distributed scheduling, DAG workflows, priority models, computing continuums, meta-orchestration
+\end{IEEEkeywords}
+
+% ==============================================================================
+\section{Introduction}
+\label{sec:introduction}
+
+Computing continuums~\cite{dustdar2023computing} integrate heterogeneous resources---cloud data centers, HPC clusters, edge devices, and IoT infrastructure---into unified execution environments. Meta-orchestration platforms such as ColonyOS~\cite{colonyos} coordinate workloads across these environments by acting as brokers between users who declare \emph{what} to compute and distributed executors that know \emph{how} to execute on their specific platforms.
+
+Workloads in these systems are expressed as directed acyclic graphs (DAGs) of processes, where each process specifies a function to execute, its arguments, resource requirements, and dependencies on other processes. The scheduler assigns waiting processes to available executors based on priority.
+
+The fundamental challenge is that these platforms serve radically different workloads concurrently: a mine seismology system producing continuous streams of safety-critical events, a satellite surveillance service triggered by new imagery, an agentic AI system dynamically growing its DAG, a multi-tenant ETL platform with SLA deadlines, infrastructure automation workflows, cross-environment HPC training pipelines, large-scale parameter sweeps, and real-time IoT edge systems where safety-critical anomaly response must preempt normal monitoring on resource-constrained edge gateways. Each workload has its own notion of what ``important'' means, yet they all compete for shared executor resources.
+
+Current systems assign priority as a single integer at submission time. This approach fails in three fundamental ways:
+
+\begin{enumerate}
+    \item \textbf{Priority is multi-dimensional.} A seismic event's importance depends on the number of sensors that triggered, the mine region, and the event classification---not a single number.
+    \item \textbf{Priority is dynamic.} An ETL pipeline's urgency increases as its SLA deadline approaches. A drug screening compound's priority depends on docking results from an earlier DAG step.
+    \item \textbf{Priority is contextual.} A cloud burst workflow's urgency depends on another workflow's queue depth. Safety-critical work must structurally guarantee preemption over best-effort research. On resource-constrained edge devices, an emergency anomaly response must be able to preempt running lower-priority monitoring processes.
+\end{enumerate}
+
+In this paper, we make the following contributions:
+
+\begin{itemize}
+    \item We present eight realistic, detailed use cases spanning the diversity of workloads in computing continuums, including a real-time IoT scenario requiring preemption (Section~\ref{sec:usecases}).
+    \item We extract common priority dimensions from these use cases and identify requirements---including preemption support---that any priority model must satisfy (Section~\ref{sec:analysis}).
+    \item We evaluate five alternative scheduling approaches and assess their suitability (Section~\ref{sec:methods}).
+    \item We propose a hybrid priority model combining lexicographic urgency classes with weighted multi-dimensional scoring, and show how it instantiates for each use case (Section~\ref{sec:model}).
+\end{itemize}
+
+% ==============================================================================
+\section{Background}
+\label{sec:background}
+
+\subsection{Computing Continuums and Meta-Orchestration}
+
+A computing continuum provides a unified abstraction over heterogeneous infrastructure. Unlike traditional orchestrators tied to specific platforms (Kubernetes for cloud, SLURM for HPC), a meta-orchestrator operates \emph{above} platform-specific schedulers, coordinating workloads across environments without directly controlling the underlying resources.
+
+In ColonyOS, the core abstractions are:
+
+\begin{itemize}
+    \item \textbf{Colony:} A distributed runtime environment comprising networked executors.
+    \item \textbf{Executor:} A worker process that connects to the colony from any network location, pulls process assignments, executes them, and reports results. Executors can run on cloud VMs, HPC nodes, edge devices, or any Internet-connected system.
+    \item \textbf{Process:} A unit of work defined by a function specification, transitioning through states: WAITING $\rightarrow$ RUNNING $\rightarrow$ SUCCESS or FAILED.
+    \item \textbf{ProcessGraph:} A DAG of processes with dependency edges. Child processes wait until all parent processes complete successfully.
+    \item \textbf{WorkflowSpec:} A declarative specification of a ProcessGraph, defining processes and their dependencies by name.
+\end{itemize}
+
+Executors request work by calling \texttt{Assign()}, which returns the highest-priority waiting process matching the executor's type and capabilities. This pull-based model means the scheduler's priority function directly determines which work gets done first.
+
+\subsection{DAG Scheduling}
+
+DAG scheduling is well-studied in parallel computing~\cite{kwok1999static}. Classical algorithms (HEFT, CPOP) focus on minimizing makespan on a fixed set of processors. Our setting differs in several ways: executors are heterogeneous and dynamically available, DAGs can be modified at runtime (processes inserted between existing nodes), and multiple independent DAGs compete for shared resources with different urgency levels.
+
+\subsection{Current Priority Mechanism}
+
+In the current system, each process has an integer \texttt{Priority} field set at submission time. The scheduler computes a \texttt{PriorityTime} value:
+
+\begin{equation}
+    \text{PriorityTime} = \text{Priority} \times \Delta t + \text{SubmissionTime}
+\end{equation}
+
+where $\Delta t$ is a constant scaling factor. The process with the lowest PriorityTime is assigned first. This creates a FIFO ordering within the same priority level, with higher-priority processes jumping ahead. While simple, this mechanism cannot express the multi-dimensional, dynamic, context-dependent priority requirements we identify in our use cases.
+
+% ==============================================================================
+\section{Use Cases}
+\label{sec:usecases}
+
+We present eight use cases that collectively represent the diversity of workloads in computing continuums. Each use case is implemented as a working Go program that constructs and submits a ProcessGraph (DAG) to a ColonyOS instance. We describe the domain context, DAG structure, and priority requirements for each.
+
+\subsection{Use Case 1: Mine Seismology (Continuous Stream)}
+\label{sec:uc1}
+
+A seismic monitoring network in the LKAB Kiruna iron ore mine consists of 12 geophones installed at four underground levels (1165m to 1450m depth). The sensors produce a continuous stream of seismogram data via RabbitMQ. For each time window (60 seconds), a processing DAG is submitted with three stages:
+
+\begin{enumerate}
+    \item \textbf{P-wave picking} (12 parallel processes): Each geophone's seismogram is analyzed using STA/LTA detection with AIC onset refinement to determine the precise P-wave arrival time. Parameters include bandpass filtering (50--2000~Hz) and minimum SNR thresholds.
+
+    \item \textbf{Event classification} (1 process, depends on all picks): A CNN-based classifier groups picks by temporal proximity and classifies each group as production blast, development blast, rockburst, or noise. The classifier uses features including pick count, amplitude ratios, frequency content, and spatial distribution.
+
+    \item \textbf{3D hypocenter location} (N parallel processes, depends on classification): For each classified event, P-wave arrival times are inverted using grid search with Simplex refinement to find the source location $(x, y, z)$ in the mine, using a layered 3D velocity model (P-wave velocities: 5200--6200~m/s across rock types).
+\end{enumerate}
+
+A new DAG is submitted every 60 seconds, creating a continuous pipeline. Each DAG contains $12 + 1 + N$ processes, where $N$ is the number of detected events (typically 1--5).
+
+\textbf{Priority requirements:}
+\begin{itemize}
+    \item Events detected by more sensors indicate larger seismic events and should be prioritized---this information is only available \emph{after} step 2 completes.
+    \item Certain mine regions (active production levels) are more safety-critical.
+    \item Rockbursts must be prioritized over production blasts.
+    \item The system is safety-critical: delayed rockburst detection can endanger lives.
+\end{itemize}
+
+\subsection{Use Case 2: Satellite Surveillance (Event-Triggered, Multi-User)}
+\label{sec:uc2}
+
+Multiple users from different organizations define surveillance jobs, each monitoring a geographic area of interest for environmental changes using Sentinel-2 satellite imagery. When new imagery becomes available for a job's area, a processing DAG is automatically spawned:
+
+\begin{enumerate}
+    \item \textbf{Download}: Fetch scene tiles and spectral bands from Copernicus Data Space.
+    \item \textbf{Preprocess}: Cloud masking (using Scene Classification Layer), co-registration against a baseline image, reprojection.
+    \item \textbf{Change detection}: Run the user's chosen algorithm (BFAST Monitor, coherence change, water index thresholding, burn severity, or shoreline extraction) against the baseline.
+    \item \textbf{Notify}: Email, SMS, or webhook notification with change map and statistics.
+\end{enumerate}
+
+Five concurrent surveillance jobs are modeled, operated by different Swedish government agencies: illegal logging detection (L\"ansstyrelsen), highway construction tracking (Trafikverket), flood monitoring (MSB), wildfire scar recovery (Naturv\aa rdsverket), and coastline erosion monitoring (SGU).
+
+\textbf{Priority requirements:}
+\begin{itemize}
+    \item Detection type determines urgency: wildfire and flooding alerts must preempt construction tracking and erosion monitoring.
+    \item Each user assigns their own importance level to their surveillance job.
+    \item Multiple jobs may trigger simultaneously from the same satellite pass.
+    \item Jobs from different organizations should be treated fairly.
+\end{itemize}
+
+\subsection{Use Case 3: Agentic AI Workflows (Dynamic DAG)}
+\label{sec:uc3}
+
+Users submit natural-language goals to an LLM-powered agentic executor. The system dynamically constructs and extends a DAG as it works:
+
+\begin{enumerate}
+    \item An initial skeleton DAG is submitted: \texttt{agent\_query} $\rightarrow$ \texttt{llm\_plan} $\rightarrow$ \texttt{plan\_handler} $\rightarrow$ \texttt{completed}.
+    \item The plan handler parses the LLM's plan and \emph{inserts} tool steps and a reflect node into the DAG between existing nodes using the \texttt{AddChild(insert=true)} mechanism.
+    \item After tool steps execute, the reflect node evaluates results. If more work is needed, additional steps and another reflect are inserted.
+    \item This loop continues until the goal is achieved or a maximum iteration count is reached.
+\end{enumerate}
+
+Multiple users submit goals concurrently, each producing an independent ProcessGraph that grows dynamically and unpredictably.
+
+\textbf{Priority requirements:}
+\begin{itemize}
+    \item DAG size is unknown at submission time---it depends on LLM decisions at runtime.
+    \item User tier should influence priority (researcher vs. student).
+    \item Resource consumption is unpredictable, making fair allocation difficult.
+\end{itemize}
+
+\subsection{Use Case 4: Multi-Tenant ETL Platform (SLA-Driven)}
+\label{sec:uc4}
+
+A shared data platform serves three organizations with different service level agreements:
+
+\textbf{Gold SLA (5-minute deadline):} A bank runs real-time fraud detection. The pipeline ingests Kafka transaction streams, enriches with geo-IP and risk scores, matches against sanctions watchlists, scores with an XGBoost ensemble, and dispatches alerts for transactions exceeding fraud thresholds.
+
+\textbf{Silver SLA (60-minute deadline):} A logistics company optimizes daily delivery routes. The pipeline ingests shipment orders and fleet GPS positions, geocodes addresses, solves a vehicle routing problem (VRP) using adaptive large neighborhood search, generates driver manifests, and sends push notifications.
+
+\textbf{Bronze SLA (24-hour deadline):} A university computes weekly bibliometric indicators. The pipeline ingests publications from DiVA, OpenAlex, and Crossref, extracts metadata, builds a citation network, computes h-indices and field-weighted citation impact, and exports results.
+
+All three pipelines compete for the same pool of \texttt{etl-worker} executors.
+
+\textbf{Priority requirements:}
+\begin{itemize}
+    \item SLA tier determines base priority (Gold $>$ Silver $>$ Bronze).
+    \item Priority should escalate as deadlines approach.
+    \item Bronze should not be completely starved---fairness matters.
+    \item Different pipeline shapes (10 processes vs. 5 processes) compete for the same executors.
+\end{itemize}
+
+\subsection{Use Case 5: Cloud Burst (Meta-Level Infrastructure)}
+\label{sec:uc5}
+
+When the seismic processing queue (Use Case~1) builds up beyond on-premise executor capacity, a cloud burst workflow is triggered to scale out:
+
+\begin{enumerate}
+    \item \textbf{Assess queue depth}: Check backlog size and wait times.
+    \item \textbf{Estimate capacity}: Calculate VMs needed within budget (EUR~50 max).
+    \item \textbf{Provision VMs}: Create 3 cloud VMs (Hetzner, cpx31).
+    \item \textbf{Install K3s}: Lightweight Kubernetes on each VM.
+    \item \textbf{Deploy executors}: Seismic-processor containers via K3s.
+    \item \textbf{Transfer data}: Velocity model and ML classifier via ColonyFS (parallel with provisioning).
+    \item \textbf{Start}: Register executors with the colony.
+    \item \textbf{Monitor}: Track costs and queue depth.
+    \item \textbf{Teardown}: When the queue drains, delete VMs and unregister executors.
+\end{enumerate}
+
+\textbf{Priority requirements:}
+\begin{itemize}
+    \item This workflow exists to help \emph{another} workflow---its priority derives from external queue state.
+    \item Creates a feedback loop: burst capacity drains the queue, reducing the burst's own urgency.
+    \item Budget constraints impose a hard ceiling independent of priority.
+\end{itemize}
+
+\subsection{Use Case 6: Cloud-to-HPC LLM Training (Cross-Environment)}
+\label{sec:uc6}
+
+A cloud platform user fine-tunes an LLM (Llama~3.1 8B) for Swedish legal text. The workflow spans two environments:
+
+\textbf{Cloud side:} Validate and tokenize 200K legal documents (court rulings, legislation, contracts), download and convert the base model to Megatron format.
+
+\textbf{Data transfer:} Upload tokenized data (85~GB) and model weights (32~GB) to the HPC scratch filesystem via ColonyFS.
+
+\textbf{HPC side (Dardel, PDC/KTH):} Fine-tune with Megatron-LM on 2~nodes $\times$ 4$\times$A100 GPUs using tensor parallelism (TP=4) and pipeline parallelism (PP=2). Evaluate on four Swedish legal benchmarks.
+
+\textbf{Transfer back:} Download trained model, evaluation report, and TensorBoard logs via ColonyFS.
+
+\textbf{Cloud side:} Register in MLflow, deploy with vLLM (OpenAI-compatible API), and validate the endpoint.
+
+\textbf{Priority requirements:}
+\begin{itemize}
+    \item The DAG crosses environment boundaries with long data transfers.
+    \item HPC processes may queue in SLURM for hours before executing.
+    \item Two parallel preparation tracks (data + model) converge at training.
+    \item Priority spans two independent scheduling domains.
+\end{itemize}
+
+\subsection{Use Case 7: Drug Discovery Parameter Sweep (Deadline-Driven Fan-Out)}
+\label{sec:uc7}
+
+A pharmaceutical company screens 25 drug candidates against SARS-CoV-2 Main Protease using a two-phase funnel:
+
+\textbf{Phase 1 (wide screening):} Prepare the protein target and force field parameters (2 parallel roots). Then dock all 25 compounds with AutoDock Vina (parallel), followed by 25 short molecular dynamics simulations (10~ns each, GPU-accelerated GROMACS). Rank candidates by binding free energy, pose stability, and hydrogen bond analysis.
+
+\textbf{Phase 2 (deep analysis):} Run 100~ns extended MD simulations with replica exchange enhanced sampling for the top 3 candidates. Generate a regulatory submission report.
+
+The workflow has a hard 48-hour deadline for a regulatory committee meeting.
+
+\textbf{Priority requirements:}
+\begin{itemize}
+    \item 25 docking + 25 short MD processes compete for GPU resources, prioritized by ML-predicted binding affinity (better candidates first).
+    \item Hard deadline: the final report must be ready in 48 hours.
+    \item Two-phase funnel: phase~2 processes should be higher priority than remaining phase~1 processes.
+    \item Shares HPC GPU resources with other workloads on the same colony.
+\end{itemize}
+
+\subsection{Use Case 8: Water Treatment IoT (Real-Time Edge with Preemption)}
+\label{sec:uc8}
+
+A municipal water treatment plant (Norrvatten, serving northern Stockholm) monitors water quality across four treatment stages---raw water intake, coagulation/flocculation, granular activated carbon filtration, and disinfection/distribution---using edge gateways deployed at each stage. Each gateway runs a ColonyOS executor with limited capacity (1--2 concurrent process slots).
+
+\textbf{Normal operation:} Every 30~seconds, a monitoring DAG is submitted for each treatment stage:
+
+\begin{enumerate}
+    \item \textbf{Collect sensors}: Read all sensors via OPC-UA from PLCs (turbidity, pH, chlorine residual, pressure, flow, UV transmittance).
+    \item \textbf{Validate readings}: Check values against safe operating ranges, detect flatlines and excessive rate-of-change.
+    \item \textbf{Aggregate metrics}: Compute rolling statistics (30s, 5min, 1h windows) and trend slopes, write to InfluxDB.
+    \item \textbf{Update dashboard}: Push to Grafana operator display.
+\end{enumerate}
+
+This produces 4~DAGs $\times$ 4~processes = 16 normal-priority processes every 30~seconds.
+
+\textbf{Anomaly response:} When a sensor breaches a safety threshold (e.g., chlorine residual drops below 0.2~mg/L, filter differential pressure exceeds 35~kPa, or raw water turbidity spikes above 4~NTU), an emergency DAG is submitted:
+
+\begin{enumerate}
+    \item \textbf{Emergency collect}: High-rate burst capture (100~Hz for 5~seconds) from all sensors in the affected stage.
+    \item \textbf{Classify severity}: ML classifier determines if the anomaly is critical, warning, or false alarm, cross-validating with neighboring sensors.
+    \item \textbf{Actuate response} and \textbf{Alert operators} (parallel): For critical events, send actuator commands (adjust chemical dosing, initiate filter backwash, reduce intake flow) while simultaneously alerting operators via SCADA, SMS, and email.
+    \item \textbf{Notify SCADA}: Update the plant-wide supervisory system and historian.
+    \item \textbf{Log incident}: Record full incident for regulatory compliance (Livsmedelsverket SLVFS 2001:30, 10-year retention).
+\end{enumerate}
+
+The emergency DAG has a hard real-time constraint: from anomaly detection to actuator response must complete within 2~seconds. On resource-constrained edge gateways with only 1--2 executor slots, meeting this constraint requires \emph{preemption}---the emergency DAG must interrupt or displace queued and potentially running normal monitoring processes.
+
+\textbf{Priority requirements:}
+\begin{itemize}
+    \item \textbf{Preemption}: Emergency processes must preempt queued and running normal-priority processes on the same edge gateway. This is not merely queue-jumping; it requires interrupting in-progress work.
+    \item \textbf{Hard real-time}: Anomaly-to-actuator latency budget of 2~seconds, with 500~ms maximum wait time for the first emergency process.
+    \item \textbf{Mixed criticality}: Safety-critical emergency work and routine monitoring share the same resource-constrained executors.
+    \item \textbf{Graduated response}: Critical anomalies (chlorine below safe level) require immediate actuator response; warnings (elevated filter pressure) require operator notification but not immediate actuation.
+    \item \textbf{Regulatory compliance}: All incidents must be logged and reported to authorities within 24~hours.
+\end{itemize}
+
+% ==============================================================================
+\section{Analysis of Priority Dimensions}
+\label{sec:analysis}
+
+Examining the eight use cases reveals that priority is determined by multiple dimensions, some universal and some domain-specific. We classify these dimensions along two axes: \emph{when} the value is known and \emph{where} it comes from.
+
+\subsection{Temporal Classification}
+
+\textbf{Static dimensions} have values fixed at submission time: SLA tier (UC4), detection type (UC2), compound predicted binding affinity (UC7), anomaly severity level (UC8).
+
+\textbf{Dynamic dimensions} change value over time without new information: deadline proximity (UC4, UC7), process wait time (all use cases), latency budget remaining (UC8).
+
+\textbf{Runtime-dependent dimensions} only become known when intermediate DAG steps complete: number of triggered sensors (UC1, after classification), candidate ranking (UC7, after short MD), DAG size (UC3, determined by LLM at runtime), confirmed severity after cross-validation (UC8, after classify step).
+
+\textbf{Externally-dependent dimensions} derive from state outside the DAG: queue depth of another workload (UC5), HPC queue wait time (UC6), budget remaining (UC5), current sensor readings breaching thresholds (UC8).
+
+\subsection{Source Classification}
+
+\textbf{Process-intrinsic:} Values from the process's own specification---function name, arguments, resource requirements, executor type.
+
+\textbf{DAG-structural:} Values from the process's position in its DAG---depth, number of downstream dependents, DAG completion percentage.
+
+\textbf{Parent-derived:} Values from the output of parent processes---classifier results, intermediate scores.
+
+\textbf{System-state:} Values from the scheduling system---queue depths, executor utilization, elapsed time.
+
+\textbf{User/tenant metadata:} Values from the process submitter---SLA tier, organizational role, budget.
+
+\subsection{Requirements}
+
+From the use cases, we derive six requirements for a priority model:
+
+\begin{enumerate}
+    \item[\textbf{R1}] \textbf{Structural safety guarantees.} Safety-critical work (UC1 rockbursts, UC2 wildfire alerts, UC8 anomaly response) must be guaranteed to preempt non-critical work, independent of parameter tuning.
+
+    \item[\textbf{R2}] \textbf{Multi-dimensional scoring.} Priority must be expressible as a function of multiple domain-specific dimensions (sensor count, mine region, event type, compound affinity, anomaly severity).
+
+    \item[\textbf{R3}] \textbf{Dynamic re-evaluation.} Priority must be recalculable when parent processes complete (UC1), deadlines approach (UC4), or external state changes (UC5).
+
+    \item[\textbf{R4}] \textbf{Multi-tenant fairness.} Lower-priority tenants must receive a minimum guaranteed share of resources, preventing starvation (UC4 Bronze tier).
+
+    \item[\textbf{R5}] \textbf{Interpretability.} Scheduling decisions must be explainable---critical for safety-critical systems (UC1, UC8) and SLA compliance auditing (UC4).
+
+    \item[\textbf{R6}] \textbf{Preemption support.} On resource-constrained executors (UC8 edge gateways), higher-priority processes must be able to preempt running lower-priority processes, not merely jump the queue. This is essential when executor capacity is severely limited and hard real-time deadlines must be met.
+\end{enumerate}
+
+% ==============================================================================
+\section{Alternative Scheduling Methods}
+\label{sec:methods}
+
+We evaluate six approaches against the six requirements identified in Section~\ref{sec:analysis}.
+
+\subsection{Weighted Sum Model}
+
+The priority of a process $p$ at time $t$ is computed as:
+
+\begin{equation}
+    \pi(p, t) = \beta(p) + \sum_{i=1}^{n} w_i \cdot d_i(p, G, S, t)
+    \label{eq:wsm}
+\end{equation}
+
+where $\beta(p)$ is a base priority, $d_i$ are dimension functions extracting normalized scores from the process $p$, its DAG $G$, system state $S$, and time $t$, and $w_i$ are user-configured weights.
+
+\textbf{Strengths:} Simple, interpretable, each dimension independently tunable, computationally inexpensive ($O(n)$ per evaluation), supports all dimension sources.
+
+\textbf{Weaknesses:} Assumes dimension independence---cannot express ``if region is critical AND sensor count is high, then emergency.'' More critically, dimensions are \emph{commensurable}: with adversarial or misconfigured weights, a Bronze bibliometrics process can theoretically accumulate enough points to outprioritize a rockburst safety alert. This violates requirement R1.
+
+\textbf{Assessment:} Satisfies R2, R3, R5. Partially satisfies R4 (via an anti-starvation dimension). Fails R1---safety guarantees depend on correct weight configuration rather than structural invariants. Does not address R6 (preemption)---priority ordering alone cannot interrupt running processes.
+
+\subsection{Rule-Based / Production Systems}
+
+Priority is determined by an ordered set of condition-action rules:
+
+\begin{lstlisting}[language=]
+IF event_type = "rockburst"
+   AND sensor_count >= 8    -> CRITICAL
+IF sla = "Gold"
+   AND deadline_remaining < 60s -> CRITICAL
+IF sla = "Bronze"               -> LOW
+\end{lstlisting}
+
+Rules are evaluated in order; the first matching rule determines priority.
+
+\textbf{Strengths:} Naturally handles non-linear interactions between dimensions (R2 partially). Highly readable---domain experts can write and audit rules (R5). Can encode structural guarantees by placing safety rules first (R1).
+
+\textbf{Weaknesses:} Rule explosion: as the number of dimensions grows, the number of rules grows combinatorially. A system covering all seven use cases could require hundreds of rules, making the rule set difficult to maintain and verify for completeness. Transitions between priority levels are discrete (cliff effects), not smooth. Difficult to formally analyze properties like starvation freedom.
+
+\textbf{Assessment:} Satisfies R1, R5. Partially satisfies R2 (at the cost of rule explosion). Poorly satisfies R3 (dynamic rules require complex meta-rules). Does not address R4 or R6 directly.
+
+\subsection{Lexicographic / Hierarchical Priority}
+
+Priority is a tuple compared lexicographically:
+
+\begin{equation}
+    \pi(p) = (c_1(p),\ c_2(p),\ \ldots,\ c_k(p))
+\end{equation}
+
+where $c_1$ is the most significant component (e.g., urgency class) and $c_k$ the least significant. Comparison proceeds left to right: a higher value in $c_i$ dominates regardless of $c_{i+1}, \ldots, c_k$.
+
+\textbf{Strengths:} Clean semantics---the hierarchy is explicit and verifiable. Safety is structural: if urgency class is $c_1$, safety-critical work \emph{cannot} be outprioritized by non-critical work regardless of other components (R1). No weight tuning needed for the hierarchy. Used successfully in production systems (Linux CFS nice levels, Kubernetes PriorityClasses).
+
+\textbf{Weaknesses:} Rigid within levels. A Bronze tenant with a 1-second deadline cannot preempt a Gold tenant's background work if SLA tier is a higher-level component than deadline proximity. Escape hatches (e.g., ``deadline override promotes urgency class'') erode the clean hierarchy. Cannot express smooth trade-offs between dimensions within the same level (R2 partially unsatisfied).
+
+\textbf{Assessment:} Strongly satisfies R1, R5. Partially satisfies R2 (within-level ordering is coarse). Supports R3 if dynamic dimensions can trigger level promotion. Does not directly address R4. Can support R6 if class transitions trigger preemption signals.
+
+\subsection{Constraint-Based Optimization}
+
+Scheduling is formulated as an optimization problem:
+
+\begin{equation}
+    \underset{x}{\text{maximize}} \sum_{p \in P} U(p) \cdot x_p \quad \text{s.t.} \quad \text{resource, fairness, deadline constraints}
+\end{equation}
+
+where $U(p)$ is a utility function and $x_p \in \{0, 1\}$ indicates whether process $p$ is scheduled.
+
+\textbf{Strengths:} Most expressive---can encode all requirements (R1--R5) as constraints. Provably optimal for the given objective. Can reason about trade-offs that other methods cannot (``sacrifice one low-value DAG to meet a deadline on a high-value one'').
+
+\textbf{Weaknesses:} Computationally expensive---solving an integer linear program at every scheduling decision does not scale to high-throughput systems (UC1 produces a new DAG every 60 seconds). Requires a global view of all pending work, which is impractical in distributed systems. Scheduling decisions are difficult to explain (R5 violated). The utility function $U(p)$ itself requires the same multi-dimensional modeling we are trying to solve.
+
+\textbf{Assessment:} Satisfies R1--R4 in theory. Can model R6 (preemption as a constraint). Fails R5 (interpretability). Impractical at scheduling-time granularity.
+
+\subsection{Machine Learning Methods}
+
+Several ML approaches have been proposed for DAG scheduling:
+
+\textbf{Reinforcement Learning (RL):} An agent observes system state (queue depths, DAG structures, resource utilization) and learns a scheduling policy by optimizing a reward function such as average completion time or deadline compliance. Notable examples include DeepRM~\cite{mao2016resource} for resource management and Decima~\cite{mao2019learning} for DAG scheduling using graph neural networks to encode DAG structure.
+
+\textbf{Learned priority functions:} Instead of hand-tuning weights $w_i$ in Equation~\ref{eq:wsm}, the weights are learned from historical scheduling outcomes via supervised learning on (process features, scheduling context, outcome quality) tuples. This automates the weight tuning process while retaining the interpretable weighted sum structure.
+
+\textbf{Graph Neural Networks (GNNs):} GNNs can encode DAG topology and learn which processes to prioritize based on structural properties---critical path length, fan-out width, depth---capturing patterns like ``this process is a bottleneck for 25 downstream processes.''
+
+\textbf{Strengths:} Can discover non-obvious scheduling strategies. GNN-based approaches (Decima) naturally handle DAG-aware scheduling. Learned priority functions can automate weight tuning. RL can adapt to changing workload patterns over time.
+
+\textbf{Weaknesses:} \emph{Interpretability}: When a rockburst alert is deprioritized and a mine worker is endangered, ``the neural network assigned a score of 0.73'' is not an acceptable explanation. Black-box scheduling decisions are problematic for safety-critical systems (R5 strongly violated for RL and GNN approaches). \emph{Training data}: RL requires extensive simulation or historical data that may not exist for new workload types. \emph{Generalization}: Models trained on one workload mix may perform poorly when new use cases are added. \emph{Stability}: RL policies can exhibit unexpected behavior in edge cases.
+
+\textbf{Assessment:} Potentially satisfies R2--R4. Fails R1 (safety guarantees are statistical, not structural) and R5 (interpretability). Does not inherently address R6 (preemption decisions require explicit mechanisms, not just score comparisons). Learned weight tuning partially satisfies R5 when combined with a weighted sum structure. Best suited as a complement to interpretable models rather than a replacement.
+
+\subsection{Comparison Summary}
+
+Table~\ref{tab:comparison} summarizes the assessment of each method against the five requirements.
+
+\begin{table}[t]
+\caption{Method comparison against requirements. \CIRCLE~= fully satisfies, \LEFTcircle~= partially satisfies, $\circ$~= does not satisfy.}
+\label{tab:comparison}
+\centering
+\small
+\newcommand{\full}{\CIRCLE}
+\newcommand{\half}{\LEFTcircle}
+\newcommand{\none}{$\circ$}
+\begin{tabular}{lcccccc}
+\toprule
+\textbf{Method} & \textbf{R1} & \textbf{R2} & \textbf{R3} & \textbf{R4} & \textbf{R5} & \textbf{R6} \\
+ & Safety & Multi-dim & Dynamic & Fairness & Interpret. & Preempt. \\
+\midrule
+Weighted Sum    & \none & \full & \full & \half & \full & \none \\
+Rule-Based      & \full & \half & \half & \none & \full & \none \\
+Lexicographic   & \full & \half & \half & \none & \full & \half \\
+Optimization    & \full & \full & \full & \full & \none & \half \\
+ML (RL/GNN)     & \none & \full & \full & \half & \none & \none \\
+ML (Learned $w$)& \none & \full & \full & \half & \half & \none \\
+\midrule
+\textbf{Hybrid} & \full & \full & \full & \full & \full & \full \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+No single method satisfies all six requirements. This motivates a hybrid approach that combines the structural guarantees of lexicographic ordering with the expressiveness of weighted multi-dimensional scoring and explicit preemption support.
+
+% ==============================================================================
+\section{Proposed Model}
+\label{sec:model}
+
+We propose a two-level priority model: lexicographic \emph{urgency classes} provide structural guarantees (R1, R5), while a weighted multi-dimensional \emph{scoring function} within each class provides expressiveness (R2, R3). Fairness constraints (R4) are enforced as scheduling policies orthogonal to priority scoring. Preemption (R6) is triggered by urgency class transitions: when a process enters the \textsc{Safety} class, it can preempt running processes of lower classes.
+
+\subsection{Urgency Classes}
+
+Every process is assigned to exactly one urgency class $C \in \{$\textsc{Safety}, \textsc{Deadline}, \textsc{Normal}, \textsc{Background}$\}$, ordered by strict dominance:
+
+\begin{equation}
+    \textsc{Safety} \succ \textsc{Deadline} \succ \textsc{Normal} \succ \textsc{Background}
+\end{equation}
+
+A process in a higher class is \emph{always} scheduled before a process in a lower class, regardless of within-class scores. Class assignment is determined by a set of \emph{promotion rules}:
+
+\begin{equation}
+    C(p, t) = \max_{r \in R} \{ c_r \mid \phi_r(p, G, S, t) = \text{true} \}
+\end{equation}
+
+where $R$ is the set of promotion rules, $c_r$ is the class that rule $r$ promotes to, and $\phi_r$ is a boolean predicate. The default class is \textsc{Normal}.
+
+Promotion rules are intentionally simple boolean predicates, not learned functions:
+
+\begin{itemize}
+    \item \textsc{Safety}: \texttt{event\_type = ``rockburst'' $\wedge$ sensor\_count $\geq$ 6} (UC1); \texttt{detection\_type = ``wildfire'' $\wedge$ change\_detected} (UC2); \texttt{anomaly\_severity = ``critical''} (UC8).
+    \item \textsc{Deadline}: \texttt{deadline\_remaining $<$ 0.1 $\times$ deadline\_total} (UC4, UC7)---any process within 10\% of its deadline; \texttt{latency\_budget\_remaining $<$ 500ms} (UC8).
+    \item \textsc{Background}: \texttt{sla = ``Bronze'' $\wedge$ no\_deadline} (UC4); \texttt{label = ``best-effort''}.
+\end{itemize}
+
+The key property is that these rules are \emph{auditable}: a human can inspect the rule set and verify that safety-critical work will always be classified correctly. This is a structural guarantee, not a statistical one.
+
+\subsection{Within-Class Scoring}
+
+Within each urgency class, processes are ordered by a weighted scoring function:
+
+\begin{equation}
+    \sigma(p, t) = \beta(p) + \sum_{i=1}^{n} w_i \cdot d_i(p, G, S, t)
+    \label{eq:score}
+\end{equation}
+
+where $\beta(p)$ is a base score, $w_i$ are configurable weights, and $d_i$ are \emph{dimension functions} that extract a normalized value $d_i \in [0, 1]$ from the available context. The process with the highest score is scheduled first.
+
+\subsubsection{Dimension Functions}
+
+A dimension function $d_i$ maps a process and its context to a normalized score. We define a taxonomy of dimension sources:
+
+\begin{itemize}
+    \item $d^{\text{kwarg}}_{k}(p) = f(\text{kwarg}(p, k))$: Extract from the process's keyword arguments and apply a transform $f$ (categorical mapping, linear scaling, etc.).
+
+    \item $d^{\text{parent}}_{k}(p, G) = f(\text{output}(\text{parent}(p, G), k))$: Extract from a parent process's output in the DAG. Only available after the parent completes; evaluates to a default value otherwise.
+
+    \item $d^{\text{dag}}(p, G) = |\{q \in G : \text{state}(q) = \text{SUCCESS}\}| / |G|$: DAG completion fraction. Captures the ``momentum'' of a partially completed DAG.
+
+    \item $d^{\text{wait}}(p, t) = \min(1, (t - t_{\text{submit}}(p)) / \tau)$: Normalized wait time with saturation constant $\tau$. Provides anti-starvation within a class.
+
+    \item $d^{\text{deadline}}(p, t) = 1 - \min(1, (t_{\text{deadline}}(p) - t) / t_{\text{total}}(p))$: Deadline proximity, from 0 (just submitted) to 1 (at deadline).
+
+    \item $d^{\text{system}}_{k}(S) = f(\text{state}(S, k))$: Extract from system state (queue depth, budget remaining, executor utilization).
+\end{itemize}
+
+\subsubsection{Transforms}
+
+The transform function $f$ normalizes raw values to $[0, 1]$:
+
+\begin{itemize}
+    \item \textbf{Linear:} $f(x) = \min(1, (x - x_{\min}) / (x_{\max} - x_{\min}))$
+    \item \textbf{Categorical:} $f(x) = m(x)$ where $m$ is a user-defined mapping
+    \item \textbf{Exponential:} $f(x) = 1 - e^{-x/\lambda}$ for deadline urgency
+    \item \textbf{Logarithmic:} $f(x) = \min(1, \log(1 + x) / \log(1 + x_{\max}))$ for anti-starvation (slow initial growth)
+\end{itemize}
+
+\subsection{Re-evaluation Triggers}
+
+Priority is not computed once at submission time. The effective priority $\Pi(p, t) = (C(p, t), \sigma(p, t))$ is re-evaluated on the following events:
+
+\begin{enumerate}
+    \item \textbf{Parent completion:} When a parent process completes, its output becomes available, enabling parent-derived dimensions ($d^{\text{parent}}$) and potentially triggering class promotion.
+    \item \textbf{Timer tick:} Periodic re-evaluation (configurable interval) updates time-dependent dimensions ($d^{\text{wait}}$, $d^{\text{deadline}}$) and can trigger deadline-based promotion to the \textsc{Deadline} class.
+    \item \textbf{System state change:} Significant changes in queue depth or executor availability trigger re-evaluation of system-dependent dimensions ($d^{\text{system}}$).
+\end{enumerate}
+
+\subsection{Fairness Constraints}
+
+Fairness is enforced as a constraint on the scheduling policy, orthogonal to priority scoring. We define minimum share guarantees per tenant:
+
+\begin{equation}
+    \forall j \in \text{Tenants}: \frac{\text{assigned}(j, \Delta t)}{\text{total\_assigned}(\Delta t)} \geq s_j
+\end{equation}
+
+where $s_j$ is the minimum share for tenant $j$ and $\Delta t$ is a sliding window. When a tenant falls below its minimum share, its next process is scheduled regardless of priority score, temporarily overriding the priority ordering.
+
+This separation is deliberate: priority determines ordering \emph{within} the fairness constraint, but fairness provides a floor that priority cannot erode.
+
+\subsection{Preemption}
+
+When a process is promoted to the \textsc{Safety} class and the target executor has no idle slots, the scheduler must preempt a running lower-class process. We define preemption as a two-step mechanism:
+
+\begin{enumerate}
+    \item \textbf{Preemption signal:} The scheduler identifies the lowest-priority running process on the target executor (or executor type) and sends a preemption signal. The executor suspends the running process, saving its state if possible (checkpoint), and marks it as WAITING with a \texttt{preempted} flag.
+    \item \textbf{Resumption:} Once the \textsc{Safety}-class process completes, the preempted process is resumed from its checkpoint (if available) or restarted.
+\end{enumerate}
+
+Preemption is only triggered across urgency class boundaries---never within the same class. This prevents cascading preemptions and ensures that preemption overhead is bounded. In practice, preemption is most relevant on resource-constrained edge executors (UC8), where the alternative---waiting for a normal-priority process to complete---would violate hard real-time constraints.
+
+The preemption policy is configurable per executor type:
+
+\begin{itemize}
+    \item \textbf{Preemptive:} Edge gateways (UC8) allow preemption of \textsc{Normal} and \textsc{Background} processes by \textsc{Safety} processes.
+    \item \textbf{Non-preemptive:} Cloud and HPC executors with abundant capacity rely on queue-jumping (the default behavior of urgency classes) without interrupting running work.
+    \item \textbf{Cooperative:} Executors that support checkpointing can save progress before yielding, reducing wasted work.
+\end{itemize}
+
+\subsection{DAG Momentum}
+
+To avoid wasting work invested in partially completed DAGs, we include a DAG completion dimension $d^{\text{dag}}$ with a positive weight. This means a process belonging to a 90\%-complete DAG receives a priority boost over an equivalent process in a newly submitted DAG. This captures the intuition that completing existing work is more valuable than starting new work, without requiring a separate mechanism.
+
+\subsection{Effective Priority}
+
+The complete effective priority is a tuple:
+
+\begin{equation}
+    \Pi(p, t) = \big(C(p, t),\ \sigma(p, t)\big)
+\end{equation}
+
+compared lexicographically. The scheduler selects the waiting process with the highest $\Pi$ that matches the requesting executor's type and capabilities.
+
+\subsection{Instantiation Examples}
+
+We illustrate how the model is instantiated for three representative use cases.
+
+\subsubsection{UC1: Mine Seismology}
+
+\begin{lstlisting}[language=,caption={Priority model for seismic processing.}]
+model: seismic_processing
+base: 10
+
+promotion_rules:
+  SAFETY:
+    - event_type = "rockburst"
+      AND sensor_count >= 6
+
+dimensions:
+  - name: sensor_count
+    source: parent_output("classify", "count")
+    transform: linear(min=3, max=12)
+    weight: 5.0
+
+  - name: mine_region
+    source: kwarg("region")
+    transform: categorical(
+      production_L1252: 1.0,
+      development_L1450: 0.7,
+      exploration: 0.3)
+    weight: 3.0
+
+  - name: event_type
+    source: parent_output("classify", "class")
+    transform: categorical(
+      rockburst: 1.0,
+      blast_production: 0.5,
+      blast_development: 0.3)
+    weight: 4.0
+\end{lstlisting}
+
+Note that \texttt{sensor\_count} and \texttt{event\_type} are parent-derived dimensions: they are only available after the classification step completes. Before that, the process uses the base priority. When the parent completes, the process's priority is re-evaluated, potentially promoting it to the \textsc{Safety} class.
+
+\subsubsection{UC4: Multi-Tenant ETL}
+
+\begin{lstlisting}[language=,caption={Priority model for multi-tenant ETL.}]
+model: tenant_pipeline
+base: 0
+
+promotion_rules:
+  DEADLINE:
+    - deadline_remaining < 0.1 * deadline_total
+
+dimensions:
+  - name: sla_tier
+    source: kwarg("sla")
+    transform: categorical(
+      Gold: 1.0, Silver: 0.5, Bronze: 0.15)
+    weight: 15.0
+
+  - name: deadline_urgency
+    source: deadline_proximity()
+    transform: exponential(halflife=300s)
+    weight: 20.0
+
+  - name: wait_time
+    source: wait_time()
+    transform: logarithmic(max=3600s)
+    weight: 2.0
+
+fairness:
+  method: weighted_fair_queue
+  min_share:
+    tenant-a: 0.50
+    tenant-b: 0.30
+    tenant-c: 0.10
+\end{lstlisting}
+
+The logarithmic transform on wait time provides anti-starvation within the \textsc{Normal} class: it grows quickly at first (preventing short starvation) then saturates (preventing unbounded priority growth that could invert SLA ordering).
+
+\subsubsection{UC7: Drug Discovery}
+
+\begin{lstlisting}[language=,caption={Priority model for drug discovery sweep.}]
+model: drug_screening
+base: 10
+
+promotion_rules:
+  DEADLINE:
+    - deadline_remaining < 4h
+
+dimensions:
+  - name: predicted_binding
+    source: kwarg("predicted_binding")
+    transform: linear(min=-12, max=-3)
+    weight: 6.0
+
+  - name: phase
+    source: kwarg("phase")
+    transform: categorical(
+      screening: 0.3, deep_analysis: 1.0)
+    weight: 5.0
+
+  - name: dag_progress
+    source: dag_completion()
+    transform: linear(min=0, max=1)
+    weight: 3.0
+
+  - name: deadline_urgency
+    source: deadline_proximity()
+    transform: exponential(halflife=6h)
+    weight: 8.0
+\end{lstlisting}
+
+Here, \texttt{predicted\_binding} ensures compounds with better predicted affinity get GPU time first. The \texttt{phase} dimension ensures that phase~2 (deep analysis) processes for the top~3 candidates are prioritized over remaining phase~1 screening processes. The \texttt{dag\_progress} dimension provides momentum: as the sweep nears completion, the final report process receives a boost.
+
+\subsubsection{UC8: Water Treatment IoT}
+
+\begin{lstlisting}[language=,caption={Priority model for IoT edge with preemption.}]
+model: water_treatment_iot
+base: 0
+
+promotion_rules:
+  SAFETY:
+    - anomaly_severity = "critical"
+  DEADLINE:
+    - latency_budget_remaining < 500ms
+
+dimensions:
+  - name: anomaly_severity
+    source: kwarg("severity")
+    transform: categorical(
+      critical: 1.0, warning: 0.6, info: 0.1,
+      normal_monitoring: 0.0)
+    weight: 10.0
+
+  - name: sensor_deviation
+    source: kwarg("trigger_value") / kwarg("threshold")
+    transform: linear(min=1.0, max=5.0)
+    weight: 4.0
+
+  - name: treatment_stage
+    source: kwarg("stage")
+    transform: categorical(
+      disinfection: 1.0,
+      filtration: 0.7,
+      coagulation: 0.5,
+      raw_intake: 0.3)
+    weight: 3.0
+
+  - name: latency_remaining
+    source: latency_budget()
+    transform: exponential(halflife=500ms)
+    weight: 8.0
+
+preemption:
+  executor_type: edge-iot
+  policy: preemptive
+  preempt_classes: [NORMAL, BACKGROUND]
+  checkpoint: cooperative_if_supported
+\end{lstlisting}
+
+The \texttt{anomaly\_severity} dimension, combined with the \textsc{Safety} promotion rule, ensures that critical anomalies immediately preempt normal monitoring on the edge gateway. The \texttt{latency\_remaining} dimension with exponential transform creates increasing urgency as the 2-second real-time budget is consumed. The preemption policy is configured specifically for the \texttt{edge-iot} executor type, reflecting the resource-constrained nature of edge gateways.
+
+% ==============================================================================
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Composability}
+
+A key advantage of the proposed model is that priority models compose naturally when multiple workload types share a colony. Each workload type defines its own dimensions and weights, but the urgency classes provide a shared framework for inter-workload ordering. A colony administrator defines the promotion rules and fairness constraints, while workload developers define the within-class scoring.
+
+\subsection{Relationship to Classical Scheduling}
+
+The model subsumes several classical scheduling policies as special cases:
+
+\begin{itemize}
+    \item \textbf{FIFO:} No dimensions, equal base priority.
+    \item \textbf{Earliest Deadline First (EDF):} One dimension $d^{\text{deadline}}$, weight 1.
+    \item \textbf{Shortest Job First (SJF):} One dimension based on estimated execution time, weight 1.
+    \item \textbf{Fair Share:} Fairness constraints with equal minimum shares and no within-class scoring.
+\end{itemize}
+
+This suggests the model is sufficiently general to serve as a unifying framework.
+
+\subsection{Role of Machine Learning}
+
+While we argued against ML-based scheduling as a standalone approach (due to interpretability concerns in safety-critical settings), ML can complement the proposed model in two ways:
+
+\textbf{Weight tuning:} The dimension weights $w_i$ can be learned from historical scheduling outcomes rather than hand-tuned. Since the model structure (dimensions and urgency classes) remains interpretable, this preserves R5 while automating parameter selection.
+
+\textbf{Dimension prediction:} ML models can predict dimension values that are not yet available. For example, in UC1, a model could predict the likely sensor count before the classification step completes, enabling earlier priority adjustment. This is a prediction within an interpretable framework, not a black-box scheduling decision.
+
+\subsection{Preemption Trade-offs}
+
+Use Case~8 demonstrates that queue-ordering alone is insufficient on resource-constrained executors. When an edge gateway has only one executor slot and it is occupied by a normal monitoring process, a safety-critical anomaly response cannot wait. Preemption introduces costs---suspended work may need to be restarted, checkpointing adds overhead, and preemption cascades must be prevented---but these costs are acceptable when the alternative is violating hard real-time safety constraints.
+
+Our model limits preemption to cross-class boundaries (\textsc{Safety} preempts \textsc{Normal}/\textsc{Background}), which bounds the preemption frequency. In practice, \textsc{Safety}-class events are rare (anomalies in a well-maintained plant), so preemption overhead is low in aggregate. The configurable preemption policy per executor type allows operators to disable preemption on executors where it is unnecessary (cloud, HPC) or enable cooperative checkpointing where supported.
+
+A key open question is the interaction between preemption and DAG momentum: if a process in a 90\%-complete normal DAG is preempted, should the DAG's momentum bonus apply when the preempted process is rescheduled? We argue yes---the investment in partially completed DAGs should not be penalized by external events.
+
+\subsection{Inter-Workflow Dependencies}
+
+Use Case~5 (cloud burst) illustrates a pattern where one workflow's priority derives from another workflow's state---the burst workflow's urgency depends on Use Case~1's queue depth. Our model handles this through system-state dimensions ($d^{\text{system}}$), but it does not formally model \emph{inter-DAG dependencies}: the case where Workflow~B cannot start until Workflow~A produces a specific output.
+
+In the current model, such dependencies must be encoded externally (e.g., a monitoring process that polls for Workflow~A's completion and then submits Workflow~B). A richer model could support first-class inter-DAG edges, where a process in one DAG depends on a process in another DAG. This would enable priority propagation across DAG boundaries---if Workflow~B is high-priority, Workflow~A's blocking process should inherit some of that urgency. Formalizing this extension without introducing circular dependencies or unbounded priority propagation is an open problem.
+
+\subsection{Failure Recovery and Retry Priority}
+
+None of the eight use cases explicitly address what happens when a process fails and must be retried. In practice, a failed process in a partially completed DAG presents a priority dilemma:
+
+\begin{itemize}
+    \item \textbf{Boost priority:} The failed process is now on the critical path of a DAG that has already consumed resources. The DAG momentum dimension naturally provides some boost, but a failed process may warrant additional urgency to avoid wasting the investment in completed upstream processes.
+    \item \textbf{Reduce priority:} If the process failed due to a transient issue (resource exhaustion, network timeout), it may fail again immediately. Reducing priority gives the system time to recover.
+    \item \textbf{Escalate class:} If a retried process causes its DAG to approach a deadline, the deadline promotion rule should trigger automatically via re-evaluation.
+\end{itemize}
+
+Our model's re-evaluation mechanism (Section~\ref{sec:model}) handles the deadline case naturally: when a failure delays a DAG, the remaining processes' deadline proximity increases, potentially promoting them to the \textsc{Deadline} class. However, the model does not currently distinguish between a first attempt and a retry. A \emph{retry count} dimension could be added to the scoring function, with a weight that could be positive (boost retries to protect DAG investment) or negative (penalize repeated failures), depending on the deployment's failure semantics.
+
+\subsection{Limitations}
+
+The model assumes that urgency classes can be cleanly separated for a given deployment. In practice, the boundary between \textsc{Safety} and \textsc{Deadline} may be domain-dependent and politically contested. The model also requires explicit configuration---promotion rules, dimension definitions, weights, and fairness shares---which imposes an operational burden on system administrators.
+
+The preemption mechanism introduces complexity in executor implementations: executors must support process suspension and, ideally, checkpointing. Not all workloads are preemptible---a GPU kernel mid-execution or a database transaction in progress cannot be cleanly interrupted. The model's per-executor-type preemption policy mitigates this, but operators must correctly classify which executor types support preemption.
+
+The fairness mechanism (minimum shares per tenant) is a simple proportional guarantee. More sophisticated fairness notions (e.g., max-min fairness, dominant resource fairness~\cite{ghodsi2011dominant}) could be integrated but are beyond the scope of this work.
+
+% ==============================================================================
+\section{Related Work}
+\label{sec:related}
+
+\textbf{DAG scheduling in clusters.} HEFT~\cite{topcuoglu2002performance} and CPOP prioritize tasks by upward rank (critical path length). These assume a fixed processor set and optimize makespan for a single DAG. Our work addresses multi-DAG scheduling on dynamic, heterogeneous executors with diverse priority requirements.
+
+\textbf{Multi-criteria scheduling.} Braun et al.~\cite{braun2001comparison} compare heuristics for heterogeneous computing. Most multi-criteria approaches target makespan and resource utilization; we focus on priority as a user-facing concern with safety and fairness requirements.
+
+\textbf{Fair scheduling.} Dominant Resource Fairness (DRF)~\cite{ghodsi2011dominant} provides max-min fairness for multi-resource environments. Our fairness constraints are simpler (proportional shares) but interact with a richer priority model.
+
+\textbf{RL for scheduling.} DeepRM~\cite{mao2016resource} and Decima~\cite{mao2019learning} apply deep RL to resource management and DAG scheduling respectively. These achieve strong performance but sacrifice interpretability, which we argue is essential for safety-critical deployments.
+
+\textbf{Workflow management systems.} Apache Airflow, Prefect, and Dagster support DAG-based workflows with basic priority levels. None provide multi-dimensional dynamic priority or cross-DAG priority dependencies.
+
+\textbf{Computing continuums.} Dustdar et al.~\cite{dustdar2023computing} survey the computing continuum vision. Our work contributes a concrete scheduling model for the heterogeneous workloads that arise in these environments.
+
+% ==============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented eight diverse workload use cases in computing continuums and demonstrated that single-integer priority is insufficient for scheduling heterogeneous DAG workloads. Through systematic analysis, we identified six requirements---structural safety guarantees, multi-dimensional scoring, dynamic re-evaluation, multi-tenant fairness, interpretability, and preemption support---and showed that no existing method satisfies all six.
+
+Our hybrid priority model combines lexicographic urgency classes with weighted multi-dimensional scoring. The urgency classes provide auditable structural guarantees for safety-critical and deadline-sensitive work, and serve as the trigger for preemption on resource-constrained edge executors. The weighted scoring function provides expressive, domain-specific ordering within each class. Fairness constraints prevent starvation independently of priority scores. The model is re-evaluated on parent completion, timer ticks, and system state changes, supporting the dynamic and runtime-dependent priority dimensions that arise in practice.
+
+The model is general---subsumes classical scheduling policies as special cases---yet practical: each component (promotion rules, dimension functions, transforms, weights, fairness shares, preemption policies) is independently configurable and interpretable. We identified inter-workflow dependencies and failure recovery as open problems that merit further investigation. Future work includes implementation in ColonyOS, empirical evaluation with the eight workload types running concurrently, investigation of learned weight tuning as a complement to manual configuration, and formal analysis of preemption overhead on edge deployments.
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\begin{thebibliography}{10}
+
+\bibitem{dustdar2023computing}
+S.~Dustdar, V.~Casamayor~Pujol, and P.~K.~Donta, ``On distributed computing continuum systems,'' \emph{IEEE Transactions on Knowledge and Data Engineering}, vol.~35, no.~4, pp.~4092--4105, 2023.
+
+\bibitem{colonyos}
+ColonyOS, ``ColonyOS -- Distributed meta-orchestrator,'' 2024. [Online]. Available: \url{https://github.com/colonyos/colonies}
+
+\bibitem{kwok1999static}
+Y.-K. Kwok and I.~Ahmad, ``Static scheduling algorithms for allocating directed task graphs to multiprocessors,'' \emph{ACM Computing Surveys}, vol.~31, no.~4, pp.~406--471, 1999.
+
+\bibitem{topcuoglu2002performance}
+H.~Topcuoglu, S.~Hariri, and M.-Y. Wu, ``Performance-effective and low-complexity task scheduling for heterogeneous computing,'' \emph{IEEE Transactions on Parallel and Distributed Systems}, vol.~13, no.~3, pp.~260--274, 2002.
+
+\bibitem{braun2001comparison}
+T.~D. Braun \emph{et al.}, ``A comparison of eleven static heuristics for mapping a class of independent tasks onto heterogeneous distributed computing systems,'' \emph{Journal of Parallel and Distributed Computing}, vol.~61, no.~6, pp.~810--837, 2001.
+
+\bibitem{ghodsi2011dominant}
+A.~Ghodsi, M.~Zaharia, B.~Hindman, A.~Konwinski, S.~Shenker, and I.~Stoica, ``Dominant resource fairness: Fair allocation of multiple resource types,'' in \emph{Proc. NSDI}, 2011, pp.~323--336.
+
+\bibitem{mao2016resource}
+H.~Mao, M.~Alizadeh, I.~Menache, and S.~Kandula, ``Resource management with deep reinforcement learning,'' in \emph{Proc. HotNets}, 2016, pp.~50--56.
+
+\bibitem{mao2019learning}
+H.~Mao, M.~Schwarzkopf, S.~B.~Venkatakrishnan, Z.~Meng, and M.~Alizadeh, ``Learning scheduling algorithms for data processing clusters,'' in \emph{Proc. SIGCOMM}, 2019, pp.~270--288.
+
+\end{thebibliography}
+
+\end{document}
